@@ -18,9 +18,7 @@ BufferPtr ArmCpuDevice::embeddingLookup(const EmbeddingLookupParams& params) {
     int copy_size = hidden_size * data_type_size;
 
     // select the rows from embedding table
-    bool use_parallel = (token_num > 64);
-    //#pragma omp parallel for if(use_parallel)
-    #pragma omp parallel for num_threads(std::min((int)(token_num/2),(int)std::thread::hardware_concurrency())) if(token_num>=2)
+    #pragma omp parallel for num_threads(std::min((int)(token_num/2),(int)std::thread::hardware_concurrency())) if(token_num>2)
     for (int index = 0; index < token_num; index++) {
         int row_index  = tokens.data<int>()[index];
         int src_offset = row_index * copy_size;
