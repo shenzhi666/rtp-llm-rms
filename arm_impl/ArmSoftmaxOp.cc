@@ -3,13 +3,12 @@
 #include "src/fastertransformer/core/allocator.h"
 #include "src/fastertransformer/core/cpu_allocator.h"
 #include <cstring>
-#include <algorithm> //std::max
+#include <algorithm>
 #include <thread>
 
 namespace fastertransformer {
 
 void scale_array(float *data, int n, float scale) {
-    // 先处理可以被4整除的部分
     int i = 0;
     float32x4_t scale_vec = vdupq_n_f32(scale);
     
@@ -34,7 +33,6 @@ void scale_array(float *data, int n, float scale) {
     }
 }
 
-//intrinsic softmax
 const std::array<float32x4_t, 8> exp_tab = {{
     vdupq_n_f32(1.f),
     vdupq_n_f32(0.0416598916054f),
@@ -167,13 +165,6 @@ void vSoftmax(int n, float* vector,float scale) {
         vector[d] = vector[d] * reduce_sum_mul;
     }
 }
-
-// void SoftmaxKernel(float* logits, int batch_size, int vocab_size) {
-//     parallel_for(batch_size, [&](int b) {
-//         vSoftmax(vocab_size, logits + b * vocab_size);
-//     });
-// }
-
 
 //intrinsic softmax
 
