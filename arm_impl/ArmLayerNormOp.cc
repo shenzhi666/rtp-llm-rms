@@ -6,7 +6,6 @@
 #include <cstring>
 #include <arm_neon.h>
 #include <algorithm> //std::all_of
-#include <thread>
 
 namespace fastertransformer {
 
@@ -136,7 +135,7 @@ void convert_float_to_fp16(const float *input, __fp16 *output, int length) {
 
 void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, float* norm_out, const float* gamma,
                const float* beta, float* residual, float* bias, const double  eps){
-
+    float32x4_t scale_v = vdupq_n_f32(2.0f);
     float32x4_t square_sum_v[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -164,6 +163,8 @@ void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, floa
         if(before_norm_output) vst1q_f32_x4(before_norm_output + d, regs);
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
+            //add_bias_residual
+            regs.val[i] = vmulq_f32(regs.val[i],scale_v);
             square_sum_v[i] = vaddq_f32(square_sum_v[i], vmulq_f32(regs.val[i], regs.val[i]));
         }        
     }
@@ -204,8 +205,10 @@ void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, floa
         if(beta) beta_v = vld1q_f32_x4(beta + d);
     #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            input_v.val[i] = vaddq_f32(input_v.val[i], Residual.val[i]);
-            input_v.val[i] = vaddq_f32(input_v.val[i], Bias.val[i]);
+            if(residual) input_v.val[i] = vaddq_f32(input_v.val[i], Residual.val[i]);
+            if(bias)     input_v.val[i] = vaddq_f32(input_v.val[i], Bias.val[i]);
+            input_v.val[i] = vmulq_f32(input_v.val[i],scale_v);
+            
             input_v.val[i] = vmulq_f32(input_v.val[i], gamma_v.val[i]);
             input_v.val[i] = vmulq_f32(input_v.val[i], rms_v);
             if(beta) input_v.val[i] = vaddq_f32(input_v.val[i], beta_v.val[i]);
@@ -217,7 +220,7 @@ void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, floa
         input_residual_bias = input[d];
         if(residual) input_residual_bias += residual[d];
         if(bias) input_residual_bias += bias[d];
-        norm_out[d] = input[d] * gamma[d] * rms;
+        norm_out[d] = 2.0f * input[d] * gamma[d] * rms;
         if(beta) norm_out[d] = norm_out[d] + beta[d];
     }
 }
@@ -288,8 +291,8 @@ void RMSNorm_Nogamma_isoutput(int n, float* before_norm_output,const float* inpu
         if(beta) beta_v = vld1q_f32_x4(beta + d);
     #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            input_v.val[i] = vaddq_f32(input_v.val[i], Residual.val[i]);
-            input_v.val[i] = vaddq_f32(input_v.val[i], Bias.val[i]);
+            if(residual) input_v.val[i] = vaddq_f32(input_v.val[i], Residual.val[i]);
+            if(bias)input_v.val[i] = vaddq_f32(input_v.val[i], Bias.val[i]);
             input_v.val[i] = vmulq_f32(input_v.val[i], rms_v);
             if(beta) input_v.val[i] = vaddq_f32(input_v.val[i], beta_v.val[i]);
         }
@@ -308,6 +311,7 @@ void RMSNorm_Nogamma_isoutput(int n, float* before_norm_output,const float* inpu
 void RMSNorm(int n, const float* input, float* norm_out, const float* gamma,
                const float* beta,const double  eps){
    float32x4_t square_sum_v[4];
+   float32x4_t scale_v = vdupq_n_f32(2.0f);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         square_sum_v[i] = vdupq_n_f32(0.0f);
@@ -318,12 +322,14 @@ void RMSNorm(int n, const float* input, float* norm_out, const float* gamma,
         float32x4x4_t regs = vld1q_f32_x4(input + d);
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
+
+            regs.val[i] = vmulq_f32(regs.val[i],scale_v);
             square_sum_v[i] = vaddq_f32(square_sum_v[i], vmulq_f32(regs.val[i], regs.val[i]));
         }        
     }
     float32_t square_sum = 0.0f;
     for (; d < n; ++d) {
-        float val = input[d];
+        float val = 2 * input[d];
         square_sum += val * val;
     }
 
@@ -350,6 +356,8 @@ void RMSNorm(int n, const float* input, float* norm_out, const float* gamma,
         if(beta) beta_v = vld1q_f32_x4(beta + d);
     #pragma unroll
         for (int i = 0; i < 4; ++i) {
+            input_v.val[i] = vmulq_f32(input_v.val[i],scale_v);
+            
             input_v.val[i] = vmulq_f32(input_v.val[i], gamma_v.val[i]);
             input_v.val[i] = vmulq_f32(input_v.val[i], rms_v);
             if(beta) input_v.val[i] = vaddq_f32(input_v.val[i], beta_v.val[i]);
@@ -359,7 +367,7 @@ void RMSNorm(int n, const float* input, float* norm_out, const float* gamma,
     float input_residual_bias;
     for (; d < n; ++d) {
         input_residual_bias = input[d];
-        norm_out[d] = input[d] * gamma[d] * rms;
+        norm_out[d] = 2.0f * input[d]  * gamma[d]* rms;
         if(beta) norm_out[d] = norm_out[d] + beta[d];
     }
 }
@@ -489,7 +497,7 @@ void layerNorm(int n,const float* input, float* norm_out, const float* gamma,
         vst1q_f32_x4(norm_out + d, input_v);
     }
     for (; d < n; ++d) {
-        if(gamma&&beta) norm_out[d] = (input[d] - mean) * gamma[d] * variance + beta[d];//with gamma and beta 
+        if(gamma&&beta) norm_out[d] = (input[d] - mean)  * variance * gamma[d]+ beta[d];//with gamma and beta 
         else if(gamma&&!beta) norm_out[d] = (input[d] - mean) * gamma[d] * variance;
         else if(!gamma&&!beta) norm_out[d] = (input[d] - mean)  * variance;
         else norm_out[d] = (input[d] - mean) * gamma[d] * variance+ beta[d];
@@ -581,7 +589,7 @@ void layerNorm_isoutput(int n,const float* input, float* norm_out, const float* 
         square_sum_v[i] = vdupq_n_f32(0.0f);
     }
 
-    int d = 0;//虚拟核资源争用？
+    int d = 0;
     for (; d <= n - 16; d += 16) {
         float32x4x4_t regs = vld1q_f32_x4(input + d);
         float32x4x4_t regs_residual_bias;
@@ -684,7 +692,7 @@ void layerNorm_Nogamma_isoutput(int n,const float* input, float* norm_out,
         square_sum_v[i] = vdupq_n_f32(0.0f);
     }
 
-    int d = 0;//虚拟核资源争用？
+    int d = 0;
     for (; d <= n - 16; d += 16) {
         float32x4x4_t regs = vld1q_f32_x4(input + d);
         float32x4x4_t regs_residual_bias;
@@ -784,7 +792,7 @@ void layerNorm_isoutput_unnormedout(int n,const float* input, float* norm_out, c
         square_sum_v[i] = vdupq_n_f32(0.0f);
     }
 
-    int d = 0;//虚拟核资源争用？
+    int d = 0;
     for (; d <= n - 16; d += 16) {
         float32x4x4_t regs = vld1q_f32_x4(input + d);
         float32x4x4_t regs_residual_bias;
@@ -888,7 +896,7 @@ void layerNorm_Nogamma_isoutput_unnormedout(int n,const float* input, float* nor
         square_sum_v[i] = vdupq_n_f32(0.0f);
     }
 
-    int d = 0;//虚拟核资源争用？
+    int d = 0;
     for (; d <= n - 16; d += 16) {
         float32x4x4_t regs = vld1q_f32_x4(input + d);
         float32x4x4_t regs_residual_bias;
@@ -985,19 +993,19 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
     void*       beta        = (weights && weights->get().beta) ? weights->get().beta.get()->data() : nullptr;
     const auto  eps         = params.eps;  
 
-    void*       before_norm_output = params.before_norm_output ? params.before_norm_output->data() : nullptr;  
+    void* before_norm_output= params.before_norm_output ? params.before_norm_output->data() : nullptr;  
     void*       residual    = params.residual1 ? params.residual1->get().data() : nullptr;
     void*       bias        = params.bias.has_value() ? params.bias->get().data() : nullptr;
-    bool        is_output = (params.residual1.has_value() || params.bias.has_value());
-    int numThreads = std::thread::hardware_concurrency();
+    bool        is_output   = (params.residual1.has_value() || params.bias.has_value());
+    int         numThreads  = omp_get_num_threads();;
     const auto  norm_type   = params.norm_type;
     int         m           = input->shape()[0];
     int         n           = input->shape()[1];
     const auto data_type = input->type();
-
+    
     if (!params.is_inplace && params.qscheme == QScheme::NoQuantize) {
         norm_output = allocateBufferLike(*params.input);
-    } else if (params.qscheme == Qint8PerChannelLastAxis) {
+    } else if (params.qscheme == Qint8PerToken) {
         throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);
     }
 
@@ -1120,6 +1128,7 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
                     return LayernormOutput({norm_output, params.before_norm_output});            
                 }
                 else{
+                    #pragma omp parallel for num_threads(std::min(m,numThreads)) if(m>=2)
                     for(int i=0;i<m;i++){
                         if(data_type == DataType::TYPE_FP16){
                         float* input_converted  = new float[n];
