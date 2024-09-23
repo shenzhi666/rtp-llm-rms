@@ -9,6 +9,15 @@
 
 namespace fastertransformer {
 
+template<typename T>
+void add_residual_bias(void* norm_out, const void* input, void* residual, int m, int n) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            ((T*)norm_out)[i * n + j] = ((T*)input)[i * n + j] + ((T*)residual)[i * n + j];
+        }
+    }
+}
+
 void add_residual_bias_float(float* norm_out, float* input, float* residual, float* bias, int n){
         int d = 0;
         for (; d <= n - 16; d += 16) {
@@ -132,10 +141,8 @@ void convert_float_to_fp16(const float *input, __fp16 *output, int length) {
     }
 
 }
-
-void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, float* norm_out, const float* gamma,
+void RMSNorm_isoutput(int n, float* before_norm_output, float* input, float* norm_out, const float* gamma,
                const float* beta, float* residual, float* bias, const double  eps){
-    float32x4_t scale_v = vdupq_n_f32(2.0f);
     float32x4_t square_sum_v[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -160,36 +167,36 @@ void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, floa
                 regs.val[i] = vaddq_f32(regs.val[i],regs_residual_bias.val[i]);
             }            
         } 
-        if(before_norm_output) vst1q_f32_x4(before_norm_output + d, regs);
+        if(before_norm_output && before_norm_output != norm_out) vst1q_f32_x4(before_norm_output + d, regs);
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             //add_bias_residual
-            regs.val[i] = vmulq_f32(regs.val[i],scale_v);
             square_sum_v[i] = vaddq_f32(square_sum_v[i], vmulq_f32(regs.val[i], regs.val[i]));
         }        
     }
     
     float32_t square_sum = 0.0f;
-    for (; d < n; ++d) {
-        float val = input[d];
-        if(residual) val+=residual[d];
-        if(bias)     val+=bias[d];
-        before_norm_output[d] = val;
-        square_sum += val * val;
-    }
+
 
     square_sum_v[0] = vaddq_f32(square_sum_v[0], square_sum_v[1]);
     square_sum_v[2] = vaddq_f32(square_sum_v[2], square_sum_v[3]);
     square_sum_v[0] = vaddq_f32(square_sum_v[0], square_sum_v[2]);
+    for (; d < n; ++d) {
+        float val = input[d];
+        if(residual) val+=residual[d];
+        if(bias)     val+=bias[d];
+        if(before_norm_output && before_norm_output != norm_out) before_norm_output[d] = val;
+        square_sum += val * val;
+    }
+//
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         square_sum += square_sum_v[0][i];
     }
-
+    
     float rms = square_sum / n;
     rms = 1.0f / std::sqrt(rms + eps);
     float32x4_t rms_v = vdupq_n_f32(rms);
-
     // normalization
     d = 0;
     float32x4x4_t input_v;
@@ -204,13 +211,12 @@ void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, floa
         if(bias) Bias = vld1q_f32_x4(bias + d);
         if(beta) beta_v = vld1q_f32_x4(beta + d);
     #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 4; ++i) {            
             if(residual) input_v.val[i] = vaddq_f32(input_v.val[i], Residual.val[i]);
             if(bias)     input_v.val[i] = vaddq_f32(input_v.val[i], Bias.val[i]);
-            input_v.val[i] = vmulq_f32(input_v.val[i],scale_v);
-            
-            input_v.val[i] = vmulq_f32(input_v.val[i], gamma_v.val[i]);
+            //input_v.val[i] = vmulq_f32(input_v.val[i],scale_v);
             input_v.val[i] = vmulq_f32(input_v.val[i], rms_v);
+            input_v.val[i] = vmulq_f32(input_v.val[i], gamma_v.val[i]);
             if(beta) input_v.val[i] = vaddq_f32(input_v.val[i], beta_v.val[i]);
         }
         vst1q_f32_x4(norm_out + d, input_v);
@@ -218,11 +224,12 @@ void RMSNorm_isoutput(int n, float* before_norm_output, const float* input, floa
     float input_residual_bias;
     for (; d < n; ++d) {
         input_residual_bias = input[d];
-        if(residual) input_residual_bias += residual[d];
-        if(bias) input_residual_bias += bias[d];
-        norm_out[d] = 2.0f * input[d] * gamma[d] * rms;
+        if(residual)  input_residual_bias += residual[d];
+        if(bias)      input_residual_bias += bias[d];
+        norm_out[d] = input_residual_bias  * rms * gamma[d];
         if(beta) norm_out[d] = norm_out[d] + beta[d];
     }
+
 }
 
 void RMSNorm_Nogamma_isoutput(int n, float* before_norm_output,const float* input, float* norm_out, 
@@ -303,7 +310,7 @@ void RMSNorm_Nogamma_isoutput(int n, float* before_norm_output,const float* inpu
         input_residual_bias = input[d];
         if(residual) input_residual_bias += residual[d];
         if(bias) input_residual_bias += bias[d];
-        norm_out[d] = input[d] * rms;
+        norm_out[d] = input_residual_bias * rms;
         if(beta) norm_out[d] = norm_out[d] + beta[d];
     }
 }
@@ -311,7 +318,7 @@ void RMSNorm_Nogamma_isoutput(int n, float* before_norm_output,const float* inpu
 void RMSNorm(int n, const float* input, float* norm_out, const float* gamma,
                const float* beta,const double  eps){
    float32x4_t square_sum_v[4];
-   float32x4_t scale_v = vdupq_n_f32(2.0f);
+   //float32x4_t scale_v = vdupq_n_f32(2.0f);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         square_sum_v[i] = vdupq_n_f32(0.0f);
@@ -323,22 +330,21 @@ void RMSNorm(int n, const float* input, float* norm_out, const float* gamma,
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
 
-            regs.val[i] = vmulq_f32(regs.val[i],scale_v);
+            //regs.val[i] = vmulq_f32(regs.val[i],scale_v);
             square_sum_v[i] = vaddq_f32(square_sum_v[i], vmulq_f32(regs.val[i], regs.val[i]));
         }        
     }
     float32_t square_sum = 0.0f;
-    for (; d < n; ++d) {
-        float val = 2 * input[d];
-        square_sum += val * val;
-    }
-
     square_sum_v[0] = vaddq_f32(square_sum_v[0], square_sum_v[1]);
     square_sum_v[2] = vaddq_f32(square_sum_v[2], square_sum_v[3]);
     square_sum_v[0] = vaddq_f32(square_sum_v[0], square_sum_v[2]);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         square_sum += square_sum_v[0][i];
+    }
+
+    for (; d < n; ++d) {
+        square_sum += input[d] * input[d];
     }
 
     float rms = square_sum / n;
@@ -356,18 +362,15 @@ void RMSNorm(int n, const float* input, float* norm_out, const float* gamma,
         if(beta) beta_v = vld1q_f32_x4(beta + d);
     #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            input_v.val[i] = vmulq_f32(input_v.val[i],scale_v);
-            
-            input_v.val[i] = vmulq_f32(input_v.val[i], gamma_v.val[i]);
+            //input_v.val[i] = vmulq_f32(input_v.val[i],scale_v);
             input_v.val[i] = vmulq_f32(input_v.val[i], rms_v);
+            input_v.val[i] = vmulq_f32(input_v.val[i], gamma_v.val[i]);
             if(beta) input_v.val[i] = vaddq_f32(input_v.val[i], beta_v.val[i]);
         }
         vst1q_f32_x4(norm_out + d, input_v);
     }
-    float input_residual_bias;
     for (; d < n; ++d) {
-        input_residual_bias = input[d];
-        norm_out[d] = 2.0f * input[d]  * gamma[d]* rms;
+        norm_out[d] = input[d]  * rms * gamma[d];
         if(beta) norm_out[d] = norm_out[d] + beta[d];
     }
 }
@@ -389,7 +392,6 @@ void RMSNorm_Nogamma(int n, const float* input, float* norm_out,
             square_sum_v[i] = vaddq_f32(square_sum_v[i], vmulq_f32(regs.val[i], regs.val[i]));
         }
     }
-    float32_t sum = 0.0f;
     float32_t square_sum = 0.0f;
     for (; d < n; ++d) {
         float val = input[d];
@@ -410,7 +412,6 @@ void RMSNorm_Nogamma(int n, const float* input, float* norm_out,
 
     // normalization
     d = 0;
-    float32x4x4_t gamma_v;
     float32x4x4_t beta_v;
     for (; d <= n - 16; d += 16) {
         float32x4x4_t input_v = vld1q_f32_x4(input + d);
@@ -557,7 +558,6 @@ void layerNorm_Nogamma(int n,const float* input, float* norm_out,
 
     // normalization
     d = 0;
-    float32x4x4_t gamma_v;
     float32x4x4_t beta_v;
     for (; d <= n - 16; d += 16) {
         float32x4x4_t input_v = vld1q_f32_x4(input + d);
@@ -989,7 +989,7 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
     BufferPtr   input       = params.input;
     BufferPtr   norm_output = input;
     const auto& weights     = params.norm_weight;                                                                 //before_norm_output is using for pre-norm,currently not implemented
-    void*       gamma       = weights ? weights->get().gamma.get()->data() : nullptr;
+    void*       gamma       = weights ? weights->get().gamma.get()->data() : nullptr;                             //
     void*       beta        = (weights && weights->get().beta) ? weights->get().beta.get()->data() : nullptr;
     const auto  eps         = params.eps;  
 
@@ -1002,36 +1002,38 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
     int         m           = input->shape()[0];
     int         n           = input->shape()[1];
     const auto data_type = input->type();
-    
     if (!params.is_inplace && params.qscheme == QScheme::NoQuantize) {
         norm_output = allocateBufferLike(*params.input);
     } else if (params.qscheme == Qint8PerToken) {
         throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);
     }
+    
 
     // Due to the cumulative errors caused by using fp16 precision calculations, the fp16 input is first converted to fp32 before using the fp32 kernel.
     if(norm_type == NormType::rmsnorm){
         if (!weights.has_value()) {//In this case, norm_output = input+residual
             if (data_type == DataType::TYPE_FP32){
-                #pragma omp parallel for num_threads(std::min(m,numThreads)) if(m>=2)
+            #pragma omp parallel for num_threads(std::min(m,numThreads)) if(m>=2)
                 for(int i = 0 ; i<m ; i++){
                     add_residual_bias_float((float*)norm_output->data()+i*n, (float*)input->data()+i*n, (bool)residual ? (float*)residual+i*n : nullptr, (float*)bias, n);
                 }  
             }
-            else if (data_type == DataType::TYPE_FP16){                  
+            else if (data_type == DataType::TYPE_FP16){                 
                 #pragma omp parallel for num_threads(std::min(m,numThreads)) if(m>=2)
                 for(int i = 0 ; i<m ; i++){
                     add_residual_bias_fp16((__fp16*)norm_output->data()+i*n, (__fp16*)input->data()+i*n, (bool)residual ? (__fp16*)residual+i*n : nullptr, (__fp16*)bias, n);
                 }                
             }
-            else {
+            else { 
                 throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);
             }
             return LayernormOutput({norm_output, params.before_norm_output});
-        }
-        if(data_type == DataType::TYPE_FP32||data_type == DataType::TYPE_FP16){  
+        }   
+        
+        if(data_type == DataType::TYPE_FP32||data_type == DataType::TYPE_FP16){  //
             if(!is_output && (!before_norm_output || before_norm_output != norm_output->data())){//without before_norm_output  is_output false
-                if (!gamma || std::all_of((float *)gamma, (float *)gamma + n, [](float value) { return value == 1.0f; })){
+                if ((data_type == DataType::TYPE_FP32&&(!gamma || std::all_of((float *)gamma, (float *)gamma + n, [](float value) { return value == 1.0f; })))
+                  ||(data_type == DataType::TYPE_FP16&&(!gamma || std::all_of((__fp16 *)gamma, (__fp16 *)gamma + n, [](__fp16 value) { return value == 1.0; })))) {
                     #pragma omp parallel for num_threads(std::min(m,numThreads)) if(m>=2)
                     for(int i=0;i<m;i++){
                         if(data_type == DataType::TYPE_FP16){//convert_float_to_fp16
@@ -1040,16 +1042,17 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
                             float* beta_converted   = new float[n];
                             convert_fp16_to_float((__fp16*)input->data()+i*n,input_converted,n);
                             convert_fp16_to_float((__fp16*)norm_output->data()+i*n,output_converted,n);
-                            convert_fp16_to_float((__fp16*)beta,beta_converted,n);
-                            RMSNorm_Nogamma(n,input_converted, output_converted, beta_converted, eps);  
+                            if(beta) convert_fp16_to_float((__fp16*)beta,beta_converted,n);
+                            RMSNorm_Nogamma(n,input_converted, output_converted, beta!= nullptr ? beta_converted : nullptr, eps);  
                             convert_float_to_fp16(output_converted,(__fp16*)norm_output->data()+i*n,n);
                             delete[] input_converted;
                             delete[] output_converted;
                             delete[] beta_converted;             
                         }
-                        else{
-                            RMSNorm_Nogamma(n,(float*)input->data()+i*n, (float*)norm_output->data()+i*n, (float*)beta, eps); 
-                        }                               
+                        else if(data_type == DataType::TYPE_FP32){
+                            RMSNorm_Nogamma(n,(float*)input->data()+i*n, (float*)norm_output->data()+i*n, beta!= nullptr ? (float*)beta : nullptr, eps);                             
+                        }
+                        else throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);                            
                     }
                     return LayernormOutput({norm_output, params.before_norm_output}); 
                 }
@@ -1072,15 +1075,17 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
                             delete[] gamma_converted;       
                             delete[] beta_converted;                    
                         }
-                        else{
-                            RMSNorm(n,(float*)input->data()+i*n, (float*)norm_output->data()+i*n, (float*) gamma ,(float*)beta, eps); 
-                            }
-                    }           
+                        else if(data_type == DataType::TYPE_FP32){   // beta!= nullptr ? (float*)beta : nullptr
+                            RMSNorm(n,(float*)input->data()+i*n, (float*)norm_output->data()+i*n, (float*) gamma ,beta!= nullptr ? (float*)beta : nullptr, eps); 
+                        }
+                        else throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);  
+                    }    
                     return LayernormOutput({norm_output, params.before_norm_output});                 
                 }
             }
             else{
-                if (!gamma || std::all_of((float *)gamma, (float *)gamma + n, [](float value) { return value == 1.0f; })){
+                if ((data_type == DataType::TYPE_FP32&&(!gamma || std::all_of((float *)gamma, (float *)gamma + n, [](float value) { return value == 1.0f; })))
+                  ||(data_type == DataType::TYPE_FP16&&(!gamma || std::all_of((__fp16 *)gamma, (__fp16 *)gamma + n, [](__fp16 value) { return value == 1.0; })))) {
                     #pragma omp parallel for num_threads(std::min(m,numThreads)) if(m>=2)
                     for(int i=0;i<m;i++){
                         if(data_type == DataType::TYPE_FP16){
@@ -1088,7 +1093,6 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
                         float* output_converted = new float[n];
                         float* beta_converted   = new float[n];
                         float* bias_converted   = new float[n];
-                        float* gamma_converted  = new float[n];
                         float* before_norm_output_converted = new float[n];
                         float* residual_converted = new float[n];
                         convert_fp16_to_float((__fp16*)input->data()+i*n,input_converted,n);
@@ -1105,14 +1109,14 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
                                                 (residual != nullptr) ? residual_converted : nullptr,\
                                                 (bias != nullptr) ? bias_converted:nullptr,\
                                                 eps); 
+                        convert_float_to_fp16(output_converted,(__fp16*)norm_output->data()+i*n,n);
+                        convert_float_to_fp16(before_norm_output_converted,(__fp16*)before_norm_output+i*n,n);
                         delete[] input_converted;
                         delete[] output_converted;
                         delete[] beta_converted ;
                         delete[] bias_converted ;
                         delete[] before_norm_output_converted ;
                         delete[] residual_converted;
-                        convert_float_to_fp16(output_converted,(__fp16*)norm_output->data()+i*n,n);
-                        convert_float_to_fp16(output_converted,(__fp16*)norm_output->data()+i*n,n);
                         }
                     else{
                         RMSNorm_Nogamma_isoutput(n,\
@@ -1121,7 +1125,7 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
                                                 (float*)norm_output->data()+i*n, \
                                                 (float*)beta, \
                                                 (residual != nullptr) ? (float*)residual + i*n : nullptr,\
-                                                (float*)bias, \
+                                                (bias != nullptr) ?(float*)bias:nullptr, \
                                                 eps);                                 
                         }
                     }
@@ -1164,16 +1168,19 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
                         delete[] before_norm_output_converted;
                         delete[] residual_converted;
                         }
-                    else{
+                        else{
+                        float* before_norm_output_converted = new float[n];
                         RMSNorm_isoutput(n,\
-                                        (before_norm_output && before_norm_output != norm_output->data())?(float*)before_norm_output+i*n : nullptr,\
+                                        (before_norm_output && before_norm_output != norm_output->data())?before_norm_output_converted : nullptr,\
                                         (float*)input->data()+i*n, \
                                         (float*)norm_output->data()+i*n, \
                                         (float*) gamma ,\
-                                        (float*)beta, \
+                                        (beta!= nullptr) ? (float*)beta : nullptr, \
                                         (residual != nullptr) ? (float*)residual + i*n : (float*)residual,\
-                                        (float*)bias,\
+                                        (bias != nullptr) ? (float*)bias:nullptr,\
                                         eps);   
+                        if(before_norm_output && before_norm_output != norm_output->data()) std::memcpy((float*)before_norm_output+i*n, before_norm_output_converted, n * sizeof(float));
+                        delete[] before_norm_output_converted;
                         }
                     }
                     return LayernormOutput({norm_output, params.before_norm_output});                 
@@ -1197,8 +1204,7 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
 // layernorm(input+bias+residual)->normed_output
 
 // **********************************************
-    if (data_type == DataType::TYPE_FP32){
-    if (norm_type == NormType::layernorm ) {
+    else if (norm_type == NormType::layernorm && data_type == DataType::TYPE_FP32){
         if(!is_output){//. .  F  
             if (!gamma || std::all_of((float *)gamma, (float *)gamma + n, [](float value) { return value == 1.0f; })){
 
@@ -1268,9 +1274,13 @@ LayernormOutput ArmCpuDevice::layernorm(const LayernormParams& params) {
             }
         }
     }
-    }
     else throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);
 }  
 
 }
+
+
+
+
+
 
